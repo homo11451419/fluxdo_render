@@ -1938,6 +1938,8 @@ List<ImageRun> collectImageRuns(List<BlockNode> nodes) {
           scanInlines(children);
         case ColoredRun(:final children):
           scanInlines(children);
+        case SizedRun(:final children):
+          scanInlines(children);
         case LinkRun(:final children):
           scanInlines(children);
         case SpoilerRun(:final children):

@@ -89,4 +89,34 @@ void main() {
     expect(last.top, greaterThan(first.top));
     expect(last.height, first.height);
   });
+
+
+  // ---- 软换行后停在空的末行 ----
+  //
+  // 回归:回车软换行(段内 `\n`)后光标"偏下",一打字就正常。
+  // `\n` 自己的选区盒落在**上一行**,而末行没有任何字符可取盒 ——
+  // top 校正若吃了这个盒,光标就会被拽离它该在的行。
+  testWidgets('软换行后的空末行:光标落在第二行,不是第一行', (tester) async {
+    final lh = lineHeightOf(style);
+    final p = await pumpPara(tester, '细说\n');
+    final line1 = SelectionHitTester.editingCaretRectIn(p, 0, lh);
+    final line2 = SelectionHitTester.editingCaretRectIn(p, 3, lh);
+    expect(line2.height, lh, reason: '高度必须恒定');
+    expect(
+      line2.top,
+      closeTo(line1.top + lh, 1.0),
+      reason: '空末行光标应正好在第一行下方一个行高处,实际 '
+          'line1=${line1.top} line2=${line2.top}',
+    );
+  });
+
+  testWidgets('空末行 vs 打字后:top 不变', (tester) async {
+    final lh = lineHeightOf(style);
+    final pEmpty = await pumpPara(tester, '细说\n');
+    final rEmpty = SelectionHitTester.editingCaretRectIn(pEmpty, 3, lh);
+    final pTyped = await pumpPara(tester, '细说\na');
+    final rTyped = SelectionHitTester.editingCaretRectIn(pTyped, 3, lh);
+    expect(rEmpty.top, closeTo(rTyped.top, 0.5),
+        reason: '打字前后光标不该跳:空=${rEmpty.top} 有字=${rTyped.top}');
+  });
 }

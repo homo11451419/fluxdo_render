@@ -3090,6 +3090,7 @@ class _TableWidget extends StatelessWidget {
           case StrongRun(:final children):
           case StyledRun(:final children):
           case ColoredRun(:final children):
+          case SizedRun(:final children):
           case LinkRun(:final children):
           case SpoilerRun(:final children):
             scanInlines(children);

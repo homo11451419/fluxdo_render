@@ -26,6 +26,17 @@ TextEditingValue? lastSetEditingState(WidgetTester tester) {
   return out;
 }
 
+Map<String, dynamic>? lastSetClientConfiguration(WidgetTester tester) {
+  Map<String, dynamic>? out;
+  for (final call in tester.testTextInput.log) {
+    if (call.method == 'TextInput.setClient') {
+      final arguments = call.arguments as List<dynamic>;
+      out = (arguments[1] as Map).cast<String, dynamic>();
+    }
+  }
+  return out;
+}
+
 class _Harness {
   _Harness(this.tester, this.state);
 
@@ -84,6 +95,20 @@ void main() {
     return (_Harness(tester, state), state);
   }
 
+  testWidgets('TextInput client carries the owning Flutter view id', (
+    tester,
+  ) async {
+    await pumpEditor(tester, paragraphs: ['']);
+
+    final editor = find.byType(FluxdoEditor);
+    await tester.tapAt(tester.getRect(editor).center);
+    await tester.pump();
+
+    final configuration = lastSetClientConfiguration(tester);
+    expect(configuration, isNotNull);
+    expect(configuration!['viewId'], View.of(tester.element(editor)).viewId);
+  });
+
   testWidgets('连续输入 60 字符(跨软换行)不丢字不乱序,光标随行', (tester) async {
     final (h, state) = await pumpEditor(tester, paragraphs: ['第一段', '']);
 
@@ -92,8 +117,11 @@ void main() {
     final rect = tester.getRect(editor);
     await tester.tapAt(Offset(rect.left + 10, rect.bottom - 10));
     await tester.pump();
-    expect(tester.testTextInput.hasAnyClients, isTrue,
-        reason: '点击后应 attach IME');
+    expect(
+      tester.testTextInput.hasAnyClients,
+      isTrue,
+      reason: '点击后应 attach IME',
+    );
     h.absorbSetEditingState();
     expect(h.platform.text, ' ', reason: '空段 attach 应喂 pad');
 
@@ -102,8 +130,11 @@ void main() {
       await h.typeChar('1');
     }
 
-    expect((state.blocks[1] as TextBlock).content.text, '1' * 60,
-        reason: '60 连击后文档不丢字不重复');
+    expect(
+      (state.blocks[1] as TextBlock).content.text,
+      '1' * 60,
+      reason: '60 连击后文档不丢字不重复',
+    );
     expect(state.selection!.extent.offset, 60, reason: '光标应在末尾');
     // 平台模型与文档一致(无纠偏残留/回环)
     expect(h.platform.text, ' ${'1' * 60}');
@@ -122,8 +153,10 @@ void main() {
     // 拖选恒折叠(= 报障"后面的文字无法选中")。
     final line3y = rect.bottom - 18;
     // kind: mouse —— 触摸 pan 已按设备分流让给滚动(移动端选区靠长按+手柄)
-    final g = await tester.startGesture(Offset(rect.left + 8, line3y),
-        kind: PointerDeviceKind.mouse);
+    final g = await tester.startGesture(
+      Offset(rect.left + 8, line3y),
+      kind: PointerDeviceKind.mouse,
+    );
     await tester.pump(const Duration(milliseconds: 40));
     for (var i = 0; i < 10; i++) {
       await g.moveBy(const Offset(20, 0));
@@ -138,10 +171,12 @@ void main() {
     expect(sel.extent.blockId, state.blocks[1].id);
     expect(sel.extent.offset, greaterThan(sel.base.offset));
     // 选区落在换行之后的行(offset 超过首行容量 ~46)
-    expect(sel.base.offset, greaterThan(46),
-        reason: '起点应在第二行之后(内容偏移,不含 ZWSP)');
-    expect(sel.extent.offset, lessThanOrEqualTo(120),
-        reason: '偏移必须在内容长度内(旧 bug:被 clamp 到 120 折叠)');
+    expect(sel.base.offset, greaterThan(46), reason: '起点应在第二行之后(内容偏移,不含 ZWSP)');
+    expect(
+      sel.extent.offset,
+      lessThanOrEqualTo(120),
+      reason: '偏移必须在内容长度内(旧 bug:被 clamp 到 120 折叠)',
+    );
     await tester.pump(const Duration(seconds: 1));
   });
 
@@ -161,8 +196,11 @@ void main() {
       await h.typeChar('1');
     }
 
-    expect((state.blocks[1] as TextBlock).content.text, '${'1' * 50}$tail',
-        reason: '前插 50 字后尾部 40 个 2 应原样保留');
+    expect(
+      (state.blocks[1] as TextBlock).content.text,
+      '${'1' * 50}$tail',
+      reason: '前插 50 字后尾部 40 个 2 应原样保留',
+    );
     expect(state.selection!.extent.offset, 50);
     await tester.pump(const Duration(seconds: 1));
   });

@@ -147,6 +147,7 @@ void main() {
               StrongRun() => 'strong',
               StyledRun() => 'styled',
               ColoredRun() => 'colored',
+              SizedRun() => 'sized',
               LineBreakRun() => 'br',
               LinkRun() => 'link',
               InlineCodeRun() => 'inlineCode',

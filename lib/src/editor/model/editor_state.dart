@@ -31,6 +31,7 @@ import 'package:flutter/foundation.dart';
 import '../../node/node.dart';
 import 'editable_text_content.dart';
 import 'editor_block.dart';
+import 'inline_markdown_parser.dart';
 import 'markdown_serializer.dart';
 
 export 'editor_block.dart';
@@ -100,6 +101,132 @@ class _HistoryEntry {
 
   final List<EditorBlock> blocks;
   final EditorSelection? selection;
+}
+
+/// 当前展开的 mark 的跟踪信息。
+@immutable
+class _RevealedMark {
+  const _RevealedMark({
+    required this.blockId,
+    required this.kind,
+    required this.revealStart,
+  });
+
+  final String blockId;
+  final MarkKind kind;
+  /// 开标记在展开后文本中的起始偏移。
+  final int revealStart;
+}
+
+/// 当前展开的块级标记跟踪信息(`# `/`- `/`1. `/`> ` 前缀显形)。
+///
+/// 块级标记不是文本、是块属性,展开 = 把属性摘掉 + 把字面前缀插到
+/// 块首;[restore] 是「把属性原样装回去」的闭包(引用帧连 groupId
+/// 一起还原,多块引用组能重新聚合)。
+@immutable
+class _RevealedBlockMarker {
+  const _RevealedBlockMarker({
+    required this.blockId,
+    required this.prefix,
+    required this.restore,
+  });
+
+  final String blockId;
+
+  /// 插到块首的字面前缀(含尾空格)。
+  final String prefix;
+
+  final TextBlock Function(TextBlock) restore;
+}
+
+/// 当前显形的原子跟踪信息(图片/emoji/mention/时间 chip)。
+@immutable
+class _RevealedAtom {
+  const _RevealedAtom({
+    required this.blockId,
+    required this.start,
+    required this.node,
+    required this.literal,
+  });
+
+  final String blockId;
+
+  /// 字面文本在块内的起始偏移。
+  final int start;
+
+  /// 原子节点原件(字面没被改过就原样装回 —— 不丢 url/href 等
+  /// 字面语法表达不出来的字段)。
+  final InlineNode node;
+
+  /// 展开时写进文本的字面 markdown。
+  final String literal;
+}
+
+/// 当前显形的分割线跟踪信息。
+///
+/// 分割线是**岛**(只读块),不像行内 mark 有字面可编辑。显形 = 把岛
+/// 换成一个装着字面 `---` 的普通文本块,离开时若字面还是分割线就装
+/// 回岛 —— 与 [_RevealedBlockMarker] 同一套"摘属性/装回属性"的思路,
+/// 只是这里摘的是整个块的类型。
+@immutable
+class _RevealedRule {
+  const _RevealedRule({required this.blockId, required this.node});
+
+  final String blockId;
+
+  /// 岛节点原件(字面没被改过就原样装回,保住 id 等字段)。
+  final BlockNode node;
+}
+
+/// 字面分割线:三个及以上的 `-` / `*` / `_`,整行别无他物。
+final RegExp _ruleLiteralRe = RegExp(r'^\s*(-{3,}|\*{3,}|_{3,})\s*$');
+
+String _markOpenTagStr(MarkKind kind) => switch (kind) {
+      MarkKind.strong => '**',
+      MarkKind.em => '*',
+      MarkKind.inlineCode => '`',
+      MarkKind.underline => '[u]',
+      MarkKind.lineThrough => '~~',
+      MarkKind.spoilerInline => '[spoiler]',
+      MarkKind.link => '[',
+      // 颜色系不参与显形(见 EditableTextContent.markAtBoundary)
+      MarkKind.textColor || MarkKind.bgColor => '',
+    };
+
+String _markCloseTagStr(MarkKind kind) => switch (kind) {
+      MarkKind.strong => '**',
+      MarkKind.em => '*',
+      MarkKind.inlineCode => '`',
+      MarkKind.underline => '[/u]',
+      MarkKind.lineThrough => '~~',
+      MarkKind.spoilerInline => '[/spoiler]',
+      MarkKind.link => ']',
+      MarkKind.textColor => '[/color]',
+      MarkKind.bgColor => '[/bgcolor]',
+    };
+
+/// 颜色系开标记的正则(色值用户可改 → 长度不固定,不能定长前缀比对)。
+/// 提到顶层常量:[_openTagLenAt] 在光标进出标记边界时反复调用,
+/// 现编正则纯属浪费。
+final RegExp _colorOpenTagRe = RegExp(r'\[color=([^\]]*)\]');
+final RegExp _bgColorOpenTagRe = RegExp(r'\[bgcolor=([^\]]*)\]');
+
+RegExp? _openTagReFor(MarkKind kind) => switch (kind) {
+      MarkKind.textColor => _colorOpenTagRe,
+      MarkKind.bgColor => _bgColorOpenTagRe,
+      _ => null,
+    };
+
+/// [start] 处开标记的实际长度;不匹配返回 null。
+int? _openTagLenAt(String text, int start, MarkKind kind) {
+  final re = _openTagReFor(kind);
+  if (re != null) {
+    final m = re.matchAsPrefix(text, start);
+    return m == null ? null : m.end - m.start;
+  }
+  final tag = _markOpenTagStr(kind);
+  if (start + tag.length > text.length) return null;
+  return text.substring(start, start + tag.length) == tag ? tag.length : null;
 }
 
 /// 编辑器状态机。
@@ -176,6 +303,508 @@ class EditorState extends ChangeNotifier {
 
   int _idCounter = 0;
   String _nextId() => 'e_${_idCounter++}';
+
+  // -----------------------------------------------------------------
+  // mark reveal: 光标在 mark 边界时展开显示标记字符
+  // -----------------------------------------------------------------
+
+  /// 当前展开的 mark 信息。
+  _RevealedMark? _revealed;
+
+  /// 尝试折叠当前展开的 mark（光标离开时调用）。
+  void _collapseRevealed() {
+    final r = _revealed;
+    if (r == null) return;
+    final i = indexOfBlock(r.blockId);
+    if (i < 0) {
+      _revealed = null;
+      return;
+    }
+    final block = _blocks[i];
+    if (block is! TextBlock) {
+      _revealed = null;
+      return;
+    }
+    final sel = _selection;
+    final cursorOffset =
+        (sel != null && sel.isCollapsed && sel.extent.blockId == r.blockId)
+            ? sel.extent.offset
+            : r.revealStart;
+    final result =
+        block.content.collapseMark(r.revealStart, r.kind, cursorOffset);
+    if (result != null) {
+      final (newContent, newCursor, _) = result;
+      final newBlocks = [..._blocks];
+      newBlocks[i] = block.copyWith(content: newContent);
+      _blocks = List.unmodifiable(newBlocks);
+      _docRevision++;
+      if (sel != null && sel.isCollapsed && sel.extent.blockId == r.blockId) {
+        _selection = EditorSelection.collapsed(EditorPosition(
+          blockId: r.blockId,
+          offset: newCursor,
+        ));
+      }
+    }
+    _revealed = null;
+  }
+
+  /// 检查光标是否在 mark 边界并展开。
+  void _tryRevealMark() {
+    final sel = _selection;
+    if (sel == null || !sel.isCollapsed) return;
+    // composing 中不展开
+    if (hasComposing) return;
+    final blockId = sel.extent.blockId;
+    final block = textBlockById(blockId);
+    if (block == null) return;
+    final offset = sel.extent.offset;
+    final mark = block.content.markAtBoundary(offset);
+    if (mark == null) return;
+    final (newContent, shift) = block.content.revealMark(mark, offset);
+    final newBlocks = [..._blocks];
+    final i = indexOfBlock(blockId);
+    newBlocks[i] = block.copyWith(content: newContent);
+    _blocks = List.unmodifiable(newBlocks);
+    _docRevision++;
+    _revealed = _RevealedMark(
+      blockId: blockId,
+      kind: mark.kind,
+      revealStart: mark.start,
+    );
+    final newOffset = (offset + shift).clamp(0, newContent.length);
+    _selection = EditorSelection.collapsed(EditorPosition(
+      blockId: blockId,
+      offset: newOffset,
+    ));
+  }
+
+  /// [blockId] 块内当前显形的字面 markdown 标记区间(渲染层淡化用)。
+  /// 空列表 = 该块没有展开态标记。
+  List<(int, int)> markerRangesOf(String blockId) {
+    final out = <(int, int)>[];
+    final q = _revealedQuote;
+    final block = textBlockById(blockId);
+    if (block == null) return out;
+    if (q != null &&
+        q.blockId == blockId &&
+        block.content.text.startsWith(q.prefix)) {
+      out.add((0, q.prefix.length));
+    }
+    final a = _revealedAtom;
+    if (a != null && a.blockId == blockId) {
+      final edited = _editedAtomLiteral(block.content.text, a.start);
+      out.add((a.start, a.start + (edited?.length ?? a.literal.length)));
+    }
+    final r = _revealed;
+    if (r != null && r.blockId == blockId) {
+      final text = block.content.text;
+      final openLen = _openTagLenAt(text, r.revealStart, r.kind);
+      final closeTag = _markCloseTagStr(r.kind);
+      if (openLen != null) {
+        final openEnd = r.revealStart + openLen;
+        out.add((r.revealStart, openEnd));
+        final closePos = text.indexOf(closeTag, openEnd);
+        if (closePos >= 0) out.add((closePos, closePos + closeTag.length));
+      }
+    }
+    return out;
+  }
+
+  /// 待自动进入编辑态的岛块 id(插入代码块/公式后把光标送进去 ——
+  /// 否则用户打完 ``` 回车,光标停在岛外面,还得再点一下)。
+  /// 由岛组件消费一次即清空。
+  String? _pendingIslandEdit;
+
+  /// 请求 [blockId] 岛插入后自动进入编辑态。
+  void requestIslandEdit(String blockId) {
+    _pendingIslandEdit = blockId;
+    notifyListeners();
+  }
+
+  /// 岛组件取用编辑请求(取到即清,不重复触发)。
+  bool consumeIslandEditRequest(String blockId) {
+    if (_pendingIslandEdit != blockId) return false;
+    _pendingIslandEdit = null;
+    return true;
+  }
+
+  /// 无条件折叠所有显形态(mark / 块级标记 / 原子),把字面标记收回
+  /// 成结构。
+  ///
+  /// 显形本来只在 navigateSelection(方向键/点击)里折叠,但离开显形区
+  /// 的路径远不止导航:回车切块、退格并块、焦点离开编辑器(点「发送」)
+  /// 走的都是别的链路 —— 不在这些地方收口,字面 `**` 会被当正文提交。
+  void commitReveals() {
+    if (_revealed != null) _collapseRevealed();
+    if (_revealedQuote != null) _collapseRevealedQuote();
+    if (_revealedAtom != null) _collapseRevealedAtom();
+    if (_revealedRule != null) _collapseRevealedRule();
+  }
+
+  /// 在光标处尝试展开 mark(input rules 用:命中后保持字面编辑态)。
+  void revealMarkAtCaret() {
+    if (_revealed != null) return;
+    _tryRevealMark();
+  }
+
+  /// 光标是否处于 mark/引用展开区域内(input rules 避让用:展开的
+  /// 标记是字面编辑态,规则命中会把它立即折叠回去,吃掉编辑功能)。
+  bool get caretInRevealedRegion =>
+      (_revealed != null && _isCursorInRevealedRegion()) ||
+      (_revealedQuote != null && _isCursorInRevealedQuoteRegion()) ||
+      (_revealedAtom != null && _isCursorInRevealedAtomRegion());
+
+  // -----------------------------------------------------------------
+  // 块级标记 reveal: 光标在块首时显形 `# ` / `- ` / `1. ` / `> `
+  // -----------------------------------------------------------------
+
+  /// 引用 reveal 的字面前缀。
+  static const String _quotePrefix = '> ';
+
+  /// 当前展开的块级标记信息。
+  _RevealedBlockMarker? _revealedQuote;
+
+  /// 光标在块首(offset 0)时,把块级标记摘成字面前缀插到块首 ——
+  /// 这样 `# `/`- `/`1. `/`> ` 本身可以直接改(改级别、换标记类型、
+  /// 退格去掉)。一次只摘最内层:标题/列表标记贴着文本,先于引用帧;
+  /// 摘完再回块首,才轮到外面的引用帧。
+  void _tryRevealQuote() {
+    final sel = _selection;
+    if (sel == null || !sel.isCollapsed) return;
+    if (hasComposing) return;
+    if (sel.extent.offset != 0) return;
+    final blockId = sel.extent.blockId;
+    final block = textBlockById(blockId);
+    if (block == null) return;
+
+    final String prefix;
+    final TextBlock Function(TextBlock) restore;
+    // 非 null = 本次摘的是引用帧,需从 containers 里移除该下标。
+    int? quoteIdx;
+    if (block.isHeading) {
+      final level = block.headingLevel;
+      prefix = '${'#' * level} ';
+      restore = (b) => b.asHeading(level);
+    } else if (block.isListItem) {
+      final ordered = block.ordered;
+      final listStart = block.listStart;
+      final depth = block.depth;
+      prefix = ordered ? '$listStart. ' : '- ';
+      restore = (b) =>
+          b.asListItem(ordered: ordered, depth: depth, listStart: listStart);
+    } else {
+      final idx = block.containers.lastIndexWhere((f) => f is QuoteFrame);
+      if (idx < 0) return;
+      final frame = block.containers[idx] as QuoteFrame;
+      prefix = _quotePrefix;
+      quoteIdx = idx;
+      // 帧原样放回原位:groupId 不变,多块引用组重新聚合。
+      restore = (b) => b.copyWith(
+            containers: [...b.containers]
+              ..insert(idx.clamp(0, b.containers.length), frame),
+          );
+    }
+
+    final i = indexOfBlock(blockId);
+    final newBlocks = [..._blocks];
+    // 摘属性用 asParagraph(归一化,防幽灵属性泄漏);引用帧的摘除
+    // 在下面单独做 —— asParagraph 会保留 containers。
+    var stripped = block.asParagraph();
+    if (quoteIdx != null) {
+      stripped = stripped.copyWith(
+        containers: [...block.containers]..removeAt(quoteIdx),
+      );
+    }
+    newBlocks[i] = stripped.copyWith(
+      content: block.content.insert(0, prefix),
+    );
+    _blocks = List.unmodifiable(newBlocks);
+    _docRevision++;
+    _revealedQuote = _RevealedBlockMarker(
+      blockId: blockId,
+      prefix: prefix,
+      restore: restore,
+    );
+    // 光标落在前缀之后(mark reveal 起始边界同款语义)
+    _selection = EditorSelection.collapsed(EditorPosition(
+      blockId: blockId,
+      offset: prefix.length,
+    ));
+  }
+
+  /// 折叠展开的块级标记:前缀完好 → 删前缀、装回属性;前缀被用户改掉
+  /// → 视为「改标记」意图,字面文本保留、属性不装回(下一次 input rule
+  /// 会按新前缀重新判定,比如 `# ` 改成 `## ` 就变二级标题)。
+  void _collapseRevealedQuote() {
+    final r = _revealedQuote;
+    if (r == null) return;
+    _revealedQuote = null;
+    final i = indexOfBlock(r.blockId);
+    if (i < 0) return;
+    final block = _blocks[i];
+    if (block is! TextBlock) return;
+    if (!block.content.text.startsWith(r.prefix)) return;
+    final newBlocks = [..._blocks];
+    newBlocks[i] = r.restore(
+      block.copyWith(content: block.content.delete(0, r.prefix.length)),
+    );
+    _blocks = List.unmodifiable(newBlocks);
+    _docRevision++;
+    final sel = _selection;
+    if (sel != null && sel.isCollapsed && sel.extent.blockId == r.blockId) {
+      final c = sel.extent.offset;
+      _selection = EditorSelection.collapsed(EditorPosition(
+        blockId: r.blockId,
+        offset: c <= r.prefix.length ? 0 : c - r.prefix.length,
+      ));
+    }
+  }
+
+  /// 光标是否仍在块级标记展开区(前缀内)且前缀完好。
+  bool _isCursorInRevealedQuoteRegion() {
+    final r = _revealedQuote;
+    if (r == null) return false;
+    final sel = _selection;
+    if (sel == null || !sel.isCollapsed) return false;
+    if (sel.extent.blockId != r.blockId) return false;
+    final block = textBlockById(r.blockId);
+    if (block == null) return false;
+    if (!block.content.text.startsWith(r.prefix)) return false;
+    return sel.extent.offset <= r.prefix.length;
+  }
+
+  // -----------------------------------------------------------------
+  // rule reveal: 方向键进分割线时显形成字面 `---`,可直接改
+  // -----------------------------------------------------------------
+
+  /// 当前显形的分割线。
+  _RevealedRule? _revealedRule;
+
+  /// 分割线岛当前是否处于显形(字面可编辑)态。
+  bool isRuleRevealed(String blockId) => _revealedRule?.blockId == blockId;
+
+  /// 把 [blockId] 处的分割线岛换成装着字面 `---` 的文本块,光标落到
+  /// [atEnd] 指定的一端(从左边进来落行首,从右边进来落行尾)。
+  ///
+  /// 返回 false = 那不是分割线岛,调用方按原来的整选逻辑处理。
+  bool _tryRevealRule(String blockId, {required bool atEnd}) {
+    final i = indexOfBlock(blockId);
+    if (i < 0) return false;
+    final block = _blocks[i];
+    if (block is! IslandBlock || block.node is! HorizontalRuleNode) {
+      return false;
+    }
+    const literal = '---';
+    final newBlocks = [..._blocks];
+    newBlocks[i] = TextBlock(
+      id: blockId,
+      content: EditableTextContent(text: literal),
+    );
+    _blocks = List.unmodifiable(newBlocks);
+    _docRevision++;
+    _revealedRule = _RevealedRule(blockId: blockId, node: block.node);
+    _selection = EditorSelection.collapsed(EditorPosition(
+      blockId: blockId,
+      offset: atEnd ? literal.length : 0,
+    ));
+    return true;
+  }
+
+  /// 折叠显形的分割线:字面还是分割线 → 装回岛(节点原件复用);字面
+  /// 被改成别的了 → 保留成普通文本块,不硬塞回去 —— 与块级标记折叠
+  /// 同一取舍:用户改了字面就是想改内容,不该被强行还原。
+  ///
+  /// 字面被删空时整块移除,否则会留下一个空段落。
+  void _collapseRevealedRule() {
+    final r = _revealedRule;
+    if (r == null) return;
+    _revealedRule = null;
+    final i = indexOfBlock(r.blockId);
+    if (i < 0) return;
+    final block = _blocks[i];
+    if (block is! TextBlock) return;
+    final text = block.content.text;
+    final newBlocks = [..._blocks];
+    if (text.trim().isEmpty) {
+      if (_blocks.length == 1) return; // 唯一块,删了就没落脚点了
+      newBlocks.removeAt(i);
+    } else if (_ruleLiteralRe.hasMatch(text)) {
+      newBlocks[i] = IslandBlock(id: r.blockId, node: r.node);
+    } else {
+      return; // 已经不是分割线了,就让它当普通文本待着
+    }
+    _blocks = List.unmodifiable(newBlocks);
+    _docRevision++;
+  }
+
+  /// 光标是否还停在显形的分割线块里。
+  bool _isCursorInRevealedRuleRegion() {
+    final r = _revealedRule;
+    if (r == null) return false;
+    final sel = _selection;
+    if (sel == null) return false;
+    return sel.base.blockId == r.blockId && sel.extent.blockId == r.blockId;
+  }
+
+  // -----------------------------------------------------------------
+  // atom reveal: 光标贴到原子(图片/emoji/mention/时间)边界时显形
+  // -----------------------------------------------------------------
+
+  /// 当前显形的原子信息。
+  _RevealedAtom? _revealedAtom;
+
+  /// 光标紧贴原子任一侧时,把原子换成字面 markdown ——
+  /// `![alt|WxH](upload://…)` / `:smile:` / `@alice`,可直接改地址/尺寸。
+  void _tryRevealAtom() {
+    final sel = _selection;
+    if (sel == null || !sel.isCollapsed) return;
+    if (hasComposing) return;
+    final blockId = sel.extent.blockId;
+    final block = textBlockById(blockId);
+    if (block == null) return;
+    final offset = sel.extent.offset;
+    // 左边界(光标在原子前)优先,其次右边界(光标在原子后)。
+    final fromLeft = block.content.isAtomAt(offset);
+    final start = fromLeft ? offset : offset - 1;
+    if (!fromLeft && (start < 0 || !block.content.isAtomAt(start))) return;
+    final node = block.content.atoms[start];
+    if (node == null) return;
+    final literal = atomToMarkdown(node);
+    if (literal == null || literal.isEmpty) return;
+
+    final newContent =
+        block.content.delete(start, start + 1).insert(start, literal);
+    final i = indexOfBlock(blockId);
+    final newBlocks = [..._blocks];
+    newBlocks[i] = block.copyWith(content: newContent);
+    _blocks = List.unmodifiable(newBlocks);
+    _docRevision++;
+    _revealedAtom = _RevealedAtom(
+      blockId: blockId,
+      start: start,
+      node: node,
+      literal: literal,
+    );
+    // 从左边进 → 停在字面开头;从右边进 → 停在末字符之前(仍在区内,
+    // 再右移一步就走出去折叠回图片,不会卡在行尾)。
+    _selection = EditorSelection.collapsed(EditorPosition(
+      blockId: blockId,
+      offset: fromLeft ? start : start + literal.length - 1,
+    ));
+  }
+
+  /// 折叠显形的原子:字面没变 → 装回原节点;字面被改过 → 图片按新
+  /// 语法重建(改地址/尺寸生效),其余类型(emoji/mention 的 url、href
+  /// 字面表达不出来)保持字面文本,交给序列化/cook 链路解释。
+  void _collapseRevealedAtom() {
+    final r = _revealedAtom;
+    if (r == null) return;
+    _revealedAtom = null;
+    final i = indexOfBlock(r.blockId);
+    if (i < 0) return;
+    final block = _blocks[i];
+    if (block is! TextBlock) return;
+    final text = block.content.text;
+    final end = r.start + r.literal.length;
+    if (end > text.length) return;
+    final current = text.substring(r.start, end);
+
+    final InlineNode? restored;
+    final int literalLen;
+    if (current == r.literal) {
+      restored = r.node;
+      literalLen = r.literal.length;
+    } else {
+      // 字面被改:按原子类型的语法边界重取(长度可能变了)。
+      final isSize = r.node is SizedRun;
+      final edited = isSize
+          ? _editedSizeLiteral(text, r.start)
+          : _editedAtomLiteral(text, r.start);
+      if (edited == null) return;
+      restored =
+          isSize ? parseSizeMarkdown(edited) : parseImageMarkdown(edited);
+      literalLen = edited.length;
+      if (restored == null) return; // 语法不完整:保持字面,交给序列化解释
+    }
+
+    final newContent = block.content
+        .delete(r.start, r.start + literalLen)
+        .insertAtom(r.start, restored);
+    final newBlocks = [..._blocks];
+    newBlocks[i] = block.copyWith(content: newContent);
+    _blocks = List.unmodifiable(newBlocks);
+    _docRevision++;
+    final sel = _selection;
+    if (sel != null && sel.isCollapsed && sel.extent.blockId == r.blockId) {
+      final c = sel.extent.offset;
+      final shrink = literalLen - 1;
+      _selection = EditorSelection.collapsed(EditorPosition(
+        blockId: r.blockId,
+        offset: c <= r.start ? c : (c - shrink).clamp(r.start, c),
+      ));
+    }
+  }
+
+  /// 从 [start] 起取一段完整的字面 `[size=N]…[/size]`(用户改过长度)。
+  static String? _editedSizeLiteral(String text, int start) {
+    if (start >= text.length || !text.startsWith('[size=', start)) return null;
+    final close = text.indexOf('[/size]', start);
+    if (close < 0) return null;
+    return text.substring(start, close + '[/size]'.length);
+  }
+
+  /// 从 [start] 起取一段完整的字面图片语法(用户改过长度)。
+  static String? _editedAtomLiteral(String text, int start) {
+    if (start >= text.length || !text.startsWith('![', start)) return null;
+    final close = text.indexOf(')', start);
+    if (close < 0) return null;
+    return text.substring(start, close + 1);
+  }
+
+  /// 光标是否仍在原子显形区内(右边界不含 —— 与 mark reveal 同规则)。
+  bool _isCursorInRevealedAtomRegion() {
+    final r = _revealedAtom;
+    if (r == null) return false;
+    final sel = _selection;
+    if (sel == null || !sel.isCollapsed) return false;
+    if (sel.extent.blockId != r.blockId) return false;
+    final block = textBlockById(r.blockId);
+    if (block == null) return false;
+    final text = block.content.text;
+    if (r.start >= text.length || !text.startsWith(r.literal[0], r.start)) {
+      return false;
+    }
+    final edited = _editedAtomLiteral(text, r.start);
+    final len = edited?.length ?? r.literal.length;
+    final c = sel.extent.offset;
+    return c >= r.start && c < r.start + len;
+  }
+
+  /// 光标是否在展开区域内。
+  bool _isCursorInRevealedRegion() {
+    final r = _revealed;
+    if (r == null) return false;
+    final sel = _selection;
+    if (sel == null || !sel.isCollapsed) return false;
+    if (sel.extent.blockId != r.blockId) return false;
+    final block = textBlockById(r.blockId);
+    if (block == null) return false;
+    // 展开区域 = [revealStart, revealStart + open + content + close]
+    // 需找到闭标记位置
+    final text = block.content.text;
+    final open = _openTagLenAt(text, r.revealStart, r.kind);
+    if (open == null) return false;
+    final closeTag = _markCloseTagStr(r.kind);
+    final close = closeTag.length;
+    final closePos = text.indexOf(closeTag, r.revealStart + open);
+    if (closePos < 0) return false;
+    final regionEnd = closePos + close;
+    final cursor = sel.extent.offset;
+    // 右边界**不含**:光标走到闭标记之后 = 编辑完成,立即折叠渲染。
+    // (含右边界的话,标记在行尾时光标无处可去,永远渲染不出来。)
+    // 左边界含:那是「在标记之前」的插入位,仍属编辑态。
+    return cursor >= r.revealStart && cursor < regionEnd;
+  }
 
   // -----------------------------------------------------------------
   // 查询
@@ -305,6 +934,50 @@ class EditorState extends ChangeNotifier {
     // 选区跳走 = composition/pending 语境失效。
     _composing = TextRange.empty;
     _clearPending();
+    notifyListeners();
+  }
+
+  /// 导航选区更新（用户点击/方向键引起的纯选区移动，非编辑）。
+  /// 在 mark 边界时自动展开标记字符。
+  void navigateSelection(EditorSelection? selection) {
+    if (_selection == selection) return;
+    _selection = selection == null ? null : _clampSelection(selection);
+    _composing = TextRange.empty;
+    _clearPending();
+    // mark reveal: 先折叠旧的，再尝试展开新的
+    var justCollapsed = false;
+    if (_revealed != null && !_isCursorInRevealedRegion()) {
+      _collapseRevealed();
+      justCollapsed = true;
+    }
+    // 刚折叠的这一步绝不再展开:折叠会把光标平移到 mark 边界上，
+    // 立刻重展开就变成「原地弹回字面」——用户看到的就是「怎么移都
+    // 不渲染」。渲染态保持到下一次导航。
+    if (_revealed == null && !justCollapsed) {
+      _tryRevealMark();
+    }
+    // quote reveal: 同样先折叠旧的（会平移光标），再尝试展开新的。
+    // 放在 mark 之后 —— 折叠前缀导致的光标平移不能反过来影响 mark 判定。
+    if (_revealedQuote != null && !_isCursorInRevealedQuoteRegion()) {
+      _collapseRevealedQuote();
+    }
+    if (_revealedQuote == null && _revealed == null) {
+      _tryRevealQuote();
+    }
+    // atom reveal: 图片/emoji/mention/时间 chip 显形成字面 markdown。
+    var atomCollapsed = false;
+    if (_revealedAtom != null && !_isCursorInRevealedAtomRegion()) {
+      _collapseRevealedAtom();
+      atomCollapsed = true;
+    }
+    if (_revealedAtom == null && !atomCollapsed && _revealed == null) {
+      _tryRevealAtom();
+    }
+    // rule reveal: 只折叠,不在这里展开 —— 分割线是岛,光标不会"路过"
+    // 它,只能由 moveCaretHorizontally 明确进入(见 _tryRevealRule)。
+    if (_revealedRule != null && !_isCursorInRevealedRuleRegion()) {
+      _collapseRevealedRule();
+    }
     notifyListeners();
   }
 
@@ -782,8 +1455,43 @@ class EditorState extends ChangeNotifier {
     ));
   }
 
+  /// 回车是否插**软换行**(段内 `\n` → cook 成 `<br>`)而非新建块。
+  ///
+  /// 宿主偏好,硬件按键链与 IME 两条回车路径共用(见 [insertNewline])。
+  /// 默认 false = 保持"回车即分块"的历史语义,由宿主显式打开。
+  ///
+  /// 背景:块间序列化用 `\n\n`,cook 成两个 `<p>`,行距比 Discourse
+  /// 网页版 composer(回车插单个 `\n`)明显大。
+  bool enterInsertsSoftBreak = false;
+
+  /// 回车的统一入口:按 [enterInsertsSoftBreak] 决定软换行还是分块。
+  ///
+  /// 列表项、标题、容器内的块始终分块 —— 前两者要接着开下一条 / 退出
+  /// 标题,软换行没有意义;容器内(引用/剧透/…)必须走 splitBlock,
+  /// 因为"回车退出容器"的逐级弹出只写在 splitBlock 里 —— 若软换行只
+  /// insertText('\n'),光标会被永远困在容器最后一个非空段里,回车多少
+  /// 次都出不去(容器内软换行本身对 BBCode/blockquote 序列化也没意义)。
+  void insertNewline() {
+    if (!enterInsertsSoftBreak) {
+      splitBlock();
+      return;
+    }
+    final sel = _selection;
+    final block = sel == null ? null : textBlockById(sel.extent.blockId);
+    if (block == null ||
+        block.isListItem ||
+        block.isHeading ||
+        block.containers.isNotEmpty) {
+      splitBlock();
+      return;
+    }
+    insertText('\n');
+  }
+
   /// 光标处回车分块(属性感知,语义表见计划)。
   void splitBlock() {
+    // 切块前先收口:光标要离开本块了,显形的字面标记必须先收回结构。
+    commitReveals();
     final sel = _selection;
     if (sel == null) return;
     // 岛整选态回车:不删岛,岛后建空段(Notion 等主流的"选中块回车")。
@@ -899,6 +1607,8 @@ class EditorState extends ChangeNotifier {
   /// [blockId] 与上一块合并(块首退格;前块 kind 胜出)。
   /// 首块/前块是岛时无操作(岛路径由 backspace 处理)。
   void mergeWithPrevious(String blockId) {
+    // 并块同理:两块的文本要拼到一起,显形的字面标记先收回结构。
+    commitReveals();
     final i = indexOfBlock(blockId);
     if (i <= 0) return;
     final prev = _blocks[i - 1];
@@ -1199,12 +1909,69 @@ class EditorState extends ChangeNotifier {
 
   /// 行内规则应用:`[matchStart, matchStart+delim+content+delim)` 区间,
   /// 删两侧定界符、对内容施加 [kind],光标落内容尾。独立 undo 步。
+  /// `![alt](src)` input rule:整段字面换成图片原子。
+  void applyImageInputRule(
+    String blockId, {
+    required int start,
+    required int end,
+    required InlineNode image,
+  }) {
+    final i = indexOfBlock(blockId);
+    if (i < 0) return;
+    final block = _blocks[i];
+    if (block is! TextBlock) return;
+    if (end > block.content.length) return;
+    final content = block.content.delete(start, end).insertAtom(start, image);
+    final newBlocks = [..._blocks];
+    newBlocks[i] = block.copyWith(content: content);
+    _commit(
+      newBlocks,
+      EditorSelection.collapsed(
+        EditorPosition(blockId: blockId, offset: start + 1),
+      ),
+      groupWithPrevious: false,
+    );
+  }
+
+  /// `[文字](href)` input rule:留下文字,href 进 link mark 的 attr。
+  void applyLinkInputRule(
+    String blockId, {
+    required int start,
+    required int end,
+    required String label,
+    required String href,
+  }) {
+    final i = indexOfBlock(blockId);
+    if (i < 0) return;
+    final block = _blocks[i];
+    if (block is! TextBlock) return;
+    if (end > block.content.length) return;
+    final content = block.content
+        .delete(start, end)
+        .insert(start, label)
+        .applyMark(start, start + label.length, MarkKind.link, attr: href);
+    final newBlocks = [..._blocks];
+    newBlocks[i] = block.copyWith(content: content);
+    _commit(
+      newBlocks,
+      EditorSelection.collapsed(
+        EditorPosition(blockId: blockId, offset: start + label.length),
+      ),
+      groupWithPrevious: false,
+    );
+  }
+
   void applyInlineInputRule(
     String blockId, {
     required int matchStart,
     required int delimLength,
     required int contentLength,
     required MarkKind kind,
+    /// 光标落在内容尾(默认,对应"刚打完闭定界符")还是内容首。
+    ///
+    /// 补打**开**定界符时光标本来就在内容首,甩到尾巴上等于替用户跳一次
+    /// 光标 —— 那不是他的意图。
+    bool caretAtEnd = true,
   }) {
     final i = indexOfBlock(blockId);
     if (i < 0) return;
@@ -1229,7 +1996,10 @@ class EditorState extends ChangeNotifier {
     _commit(
       newBlocks,
       EditorSelection.collapsed(
-        EditorPosition(blockId: blockId, offset: matchStart + contentLength),
+        EditorPosition(
+          blockId: blockId,
+          offset: caretAtEnd ? matchStart + contentLength : matchStart,
+        ),
       ),
       groupWithPrevious: false,
     );
@@ -1443,12 +2213,42 @@ class EditorState extends ChangeNotifier {
     final paras = sanitized.split('\n\n');
     var n = 0;
     pasteBlocks([
-      for (final p in paras)
-        TextBlock(
-          id: 'p_${n++}',
-          content: EditableTextContent(text: p),
-        ),
+      for (final p in paras) _paragraphFromMarkdown('p_${n++}', p),
     ]);
+  }
+
+  /// 一段纯文本 → 块:行首块级标记(`# `/`- `/`1. `/`> `)转结构,
+  /// 正文走轻量行内解析(`**加粗**` 不该原样躺成字面星号)。
+  static TextBlock _paragraphFromMarkdown(String id, String source) {
+    var body = source;
+    var quoted = false;
+    if (body.startsWith('> ')) {
+      body = body.substring(2);
+      quoted = true;
+    }
+    final heading = RegExp(r'^(#{1,6}) ').firstMatch(body);
+    final bullet = RegExp(r'^[-*] ').firstMatch(body);
+    final ordered = RegExp(r'^(\d{1,9})[.)] ').firstMatch(body);
+    final marker = heading ?? bullet ?? ordered;
+    if (marker != null) body = body.substring(marker.group(0)!.length);
+
+    var block = TextBlock(id: id, content: parseInlineMarkdown(body));
+    if (heading != null) {
+      block = block.asHeading(heading.group(1)!.length);
+    } else if (bullet != null) {
+      block = block.asListItem(ordered: false);
+    } else if (ordered != null) {
+      block = block.asListItem(
+        ordered: true,
+        listStart: int.tryParse(ordered.group(1)!) ?? 1,
+      );
+    }
+    if (quoted) {
+      block = block.copyWith(
+        containers: [QuoteFrame(groupId: nextFrameGroupId())],
+      );
+    }
+    return block;
   }
 
   /// 片段块重发 id(粘贴片段可能来自本文档自身的复制,原 id 会碰撞)。
@@ -1620,7 +2420,7 @@ class EditorState extends ChangeNotifier {
             direction < 0 ? _positionBefore(ti) : _positionAfter(ti);
         if (moved != null) target = moved;
       }
-      updateSelection(EditorSelection.collapsed(target));
+      navigateSelection(EditorSelection.collapsed(target));
       return;
     }
     final pos = sel.extent;
@@ -1630,14 +2430,13 @@ class EditorState extends ChangeNotifier {
     EditorPosition? next;
 
     if (block is IslandBlock) {
-      // 岛端点上移动:跨到另一侧邻块。
       if (direction < 0) {
         next = _positionBefore(i);
       } else {
         next = _positionAfter(i);
       }
       if (next == null) return;
-      updateSelection(
+      navigateSelection(
         extend
             ? EditorSelection(base: sel.base, extent: next)
             : EditorSelection.collapsed(next),
@@ -1655,7 +2454,12 @@ class EditorState extends ChangeNotifier {
       } else if (i > 0) {
         final prev = _blocks[i - 1];
         if (prev is IslandBlock && !extend) {
-          // 一步 = 整选岛(两段式)
+          // 分割线从右边进 → 显形成字面 `---`,光标落行尾(可直接退格
+          // 改格式);其余岛保持整选。
+          if (_tryRevealRule(prev.id, atEnd: true)) {
+            notifyListeners();
+            return;
+          }
           _selectIsland(prev.id);
           return;
         }
@@ -1676,6 +2480,11 @@ class EditorState extends ChangeNotifier {
       } else if (i + 1 < _blocks.length) {
         final nextBlock = _blocks[i + 1];
         if (nextBlock is IslandBlock && !extend) {
+          // 分割线从左边进 → 显形,光标落行首
+          if (_tryRevealRule(nextBlock.id, atEnd: false)) {
+            notifyListeners();
+            return;
+          }
           _selectIsland(nextBlock.id);
           return;
         }
@@ -1685,7 +2494,7 @@ class EditorState extends ChangeNotifier {
       }
     }
     if (next == null) return;
-    updateSelection(
+    navigateSelection(
       extend
           ? EditorSelection(base: sel.base, extent: next)
           : EditorSelection.collapsed(next),

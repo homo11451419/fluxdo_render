@@ -171,8 +171,15 @@ class SelectionToolbar {
                   padding: TextSelectionToolbarTextButton.getPadding(
                       i, items.length),
                   onPressed: items[i].onPressed,
-                  child: Text(AdaptiveTextSelectionToolbar.getButtonLabel(
-                      ctx, items[i])),
+                  // TextSelectionToolbarTextButton 内部用固定的 SDK 默认样式,
+                  // 不读取 ambient Theme,导致这里的文字始终是系统兜底字体
+                  // (与全局设置的自定义字体不一致,CJK 下尤其明显)。显式套
+                  // Theme 的 textTheme 让它跟随 app 全局字体设置。
+                  child: Text(
+                    AdaptiveTextSelectionToolbar.getButtonLabel(
+                        ctx, items[i]),
+                    style: Theme.of(ctx).textTheme.bodyMedium,
+                  ),
                 ),
             ],
           );

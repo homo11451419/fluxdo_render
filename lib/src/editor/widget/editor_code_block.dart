@@ -29,6 +29,7 @@ class EditorCodeBlock extends StatefulWidget {
     required this.node,
     required this.onChanged,
     this.selected = false,
+    this.autoEdit = false,
     this.onSelectRequest,
     this.highlightBuilder,
   });
@@ -40,6 +41,9 @@ class EditorCodeBlock extends StatefulWidget {
 
   /// 整选态(编辑器选区恰覆盖本块):primary 描边。
   final bool selected;
+
+  /// 插入后自动进入编辑态并聚焦代码框(``` 回车新建时为 true)。
+  final bool autoEdit;
 
   /// 左上角选择柄点击 → 编辑器整选本块(选中后退格/Delete 删除)。
   final VoidCallback? onSelectRequest;
@@ -66,6 +70,11 @@ class _EditorCodeBlockState extends State<EditorCodeBlock> {
   @override
   void initState() {
     super.initState();
+    if (widget.autoEdit) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _startEdit();
+      });
+    }
     // 失焦提交:code 与 lang 两个焦点都离开才算离开编辑态(在两个
     // 输入框之间切换不提交不退出)。
     _codeFocus.addListener(_onFocusChange);

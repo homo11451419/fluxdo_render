@@ -164,6 +164,36 @@ class ColoredRun extends InlineNode {
       'ColoredRun(color: $color, bg: $background, ${children.length} children)';
 }
 
+/// 字号缩放(`<span style="font-size:N%">`;Discourse `[size=N]` BBCode 产出)。
+///
+/// [scale] 是**相对父字号的倍数**(网页端语义:`[size=150]` → `150%` →
+/// 1.5;`[size=0]` → `0%` → 0 = 视觉隐藏)。阅读端对齐网页端原样生效,
+/// 不夹上下限;编辑端把它当行内原子渲染成固定块(见 doc_converter),
+/// 免得 0 倍隐形/超大撑破编辑器。
+@immutable
+class SizedRun extends InlineNode {
+  const SizedRun({required this.scale, required this.children});
+
+  /// 相对父字号的倍数(1.0 = 100%)。
+  final double scale;
+
+  final List<InlineNode> children;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is SizedRun &&
+          runtimeType == other.runtimeType &&
+          scale == other.scale &&
+          listEquals(children, other.children);
+
+  @override
+  int get hashCode => Object.hash(scale, Object.hashAll(children));
+
+  @override
+  String toString() => 'SizedRun(${scale}x, ${children.length} children)';
+}
+
 /// `<br>` 强制换行。
 @immutable
 class LineBreakRun extends InlineNode {

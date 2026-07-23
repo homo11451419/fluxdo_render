@@ -32,6 +32,7 @@ TextBlock tb(
     );
 
 void main() {
+  _bareUrlTests();
   group('行内 mark', () {
     test('粗体/斜体/删除线/行内代码/下划线', () {
       expect(
@@ -495,7 +496,9 @@ void main() {
         serializeIslandNode(const ParagraphNode(id: 'b', inlines: [
           ColoredRun(color: Color(0xFFE03E2D), children: [TextRun('红')]),
         ])),
-        '<span style="color:#e03e2d">红</span>',
+        // BBCode 而非 span[style]:后者的 style 会被消毒器剥掉,
+        // 客户端 cook 往返门禁过不了(见 _serializeColored 注释)
+        '[color=#e03e2d]红[/color]',
       );
     });
 
@@ -562,6 +565,42 @@ void main() {
         '  <source src="/uploads/short-url/xyz.xz" type="video/mp4">\n'
         '</video>',
       );
+    });
+  });
+}
+
+/// 裸 URL 往返:cook 给裸 URL linkify 时会补 scheme(锚文本无 scheme、
+/// href 有),锚文本与 href 只差 scheme 时仍应写回裸 URL —— 否则用户写的
+/// `dl.google.com` 打开一次就被改写成 `[dl.google.com](http://dl.google.com)`。
+void _bareUrlTests() {
+  MarkSpan link(int s, int e, String href) =>
+      MarkSpan(start: s, end: e, kind: MarkKind.link, attr: href);
+
+  String md(String text, MarkSpan m) => docToMarkdown([
+        TextBlock(id: 'b0', content: EditableTextContent(text: text, marks: [m])),
+      ]);
+
+  group('裸 URL 序列化', () {
+    test('锚文本与 href 只差 scheme → 写回裸 URL', () {
+      expect(md('看 dl.google.com 吧', link(2, 15, 'http://dl.google.com')),
+          '看 dl.google.com 吧');
+      expect(md('看 dl.google.com 吧', link(2, 15, 'https://dl.google.com')),
+          '看 dl.google.com 吧');
+    });
+
+    test('锚文本与 href 完全相同 → 仍写回裸 URL(原有行为)', () {
+      expect(
+        md('看 https://a.b 吧', link(2, 13, 'https://a.b')),
+        '看 https://a.b 吧',
+      );
+    });
+
+    test('真·带文字的链接不受影响', () {
+      expect(md('看 这里 吧', link(2, 4, 'https://a.b')),
+          '看 [这里](https://a.b) 吧');
+      // 锚文本是另一个地址(不是同一 URL 的裸形态)→ 不能当裸 URL
+      expect(md('看 a.com 吧', link(2, 7, 'https://b.com')),
+          '看 [a.com](https://b.com) 吧');
     });
   });
 }

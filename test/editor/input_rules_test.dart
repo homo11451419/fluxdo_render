@@ -175,4 +175,93 @@ void main() {
       );
     });
   });
+
+  group('填内容匹配(先打定界符再回中间填字)', () {
+    test('**|** 中间打 q → 命中但保持字面(光标仍夹在定界符间)', () {
+      final s = empty();
+      s.insertText('****');
+      s.updateSelection(EditorSelection.collapsed(
+          EditorPosition(blockId: s.blocks.first.id, offset: 2)));
+      expect(type(s, 'q'), InputRuleOutcome.applied);
+      expect(first(s).content.text, '**q**', reason: '展开态,可继续输入');
+      expect(first(s).content.marks, isEmpty);
+      expect(s.selection!.extent.offset, 3, reason: '光标在 q 之后');
+    });
+
+    test('光标走出闭定界符 → 折叠渲染(行尾也能渲染)', () {
+      final s = empty();
+      s.insertText('****');
+      s.updateSelection(EditorSelection.collapsed(
+          EditorPosition(blockId: s.blocks.first.id, offset: 2)));
+      type(s, 'q');
+      final id = s.blocks.first.id;
+      // 右移到闭定界符之后(文本末尾 5)
+      s.navigateSelection(
+          EditorSelection.collapsed(EditorPosition(blockId: id, offset: 5)));
+      expect(first(s).content.text, 'q');
+      expect(first(s).content.marks.single.kind, MarkKind.strong);
+      expect(s.selection!.extent.offset, 1);
+    });
+
+    test('`|` 中间打 x;~~|~~ → 命中(均为字面展开态)', () {
+      var s = empty();
+      s.insertText('``');
+      s.updateSelection(EditorSelection.collapsed(
+          EditorPosition(blockId: s.blocks.first.id, offset: 1)));
+      expect(type(s, 'x'), InputRuleOutcome.applied);
+      expect(first(s).content.text, '`x`');
+
+      s = empty();
+      s.insertText('~~~~');
+      s.updateSelection(EditorSelection.collapsed(
+          EditorPosition(blockId: s.blocks.first.id, offset: 2)));
+      expect(type(s, 'x'), InputRuleOutcome.applied);
+      expect(first(s).content.text, '~~x~~');
+    });
+
+    test('排除:光标后不是定界符不触发;***q*** 归属不明不触发', () {
+      var s = empty();
+      s.insertText('**qw**');
+      s.updateSelection(EditorSelection.collapsed(
+          EditorPosition(blockId: s.blocks.first.id, offset: 3)));
+      // 光标在 w 前(后面是 w 不是定界符)
+      expect(
+        tryApplyInputRules(s, s.blocks.first.id, typedChar: 'q'),
+        InputRuleOutcome.none,
+      );
+
+      s = empty();
+      s.insertText('***q***');
+      s.updateSelection(EditorSelection.collapsed(
+          EditorPosition(blockId: s.blocks.first.id, offset: 4)));
+      expect(
+        tryApplyInputRules(s, s.blocks.first.id, typedChar: 'q'),
+        InputRuleOutcome.none,
+      );
+    });
+
+    test('mark 展开区内不触发(展开的 ** 是字面编辑态)', () {
+      final s = EditorState(blocks: [
+        TextBlock(
+          id: 'b0',
+          content: EditableTextContent(
+            text: 'hello world',
+            marks: [MarkSpan(start: 6, end: 11, kind: MarkKind.strong)],
+          ),
+        ),
+      ]);
+      addTearDown(s.dispose);
+      // 光标到边界 → 展开为 "hello **world**",光标 8
+      s.navigateSelection(const EditorSelection.collapsed(
+          EditorPosition(blockId: 'b0', offset: 6)));
+      expect(first(s).content.text, 'hello **world**');
+      // 在展开区内打字(光标后不远处有闭 **)—— 规则必须避让
+      s.imeReplace('b0', 13, 13, 'x', caretOffset: 14);
+      expect(
+        tryApplyInputRules(s, 'b0', typedChar: 'x'),
+        InputRuleOutcome.none,
+      );
+      expect(first(s).content.text, 'hello **worldx**', reason: '保持字面');
+    });
+  });
 }

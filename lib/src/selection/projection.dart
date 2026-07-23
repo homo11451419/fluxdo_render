@@ -183,6 +183,14 @@ class RenderTextProjection {
         ProjectionKind.localDate ||
         ProjectionKind.image =>
           1,
+        // **mentionText 同样宽 1**:无状态 emoji 的 mention 走纯 TextSpan
+        // 路径(药丸底色由 painter 自绘),渲染占 '@username' 那么多字符,
+        // 但编辑模型里仍旧只是一个 FFFC 原子。漏了这条就会按字符计长 ——
+        // 光标被算进药丸内部(真机症状:@arch_linux 的光标停在 "ar|ch"),
+        // 且原子之后的所有偏移全部错位。
+        ProjectionKind.mentionText => 1,
+        // 药丸内边距:同 codePad,不属于内容,光标不停。
+        ProjectionKind.mentionPad => 0,
         _ when e.isAtomic => e.logicalText.length,
         _ => _contentLenOf(e.logicalText),
       };

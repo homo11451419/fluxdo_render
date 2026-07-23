@@ -306,6 +306,29 @@ class InlineFlattener {
           children:
               _build(children, p, inheritedRecognizer: inheritedRecognizer),
         ),
+      // 字号缩放(`[size=N]` → `font-size:N%`):用 fontSize 的**相对倍数**
+      // 表达,对齐网页端 —— 0 倍即视觉隐藏,不夹上下限。
+      SizedRun(:final scale, :final children) => TextSpan(
+          // 基准取块的实际基础字号(emojiBaseSize 即 baseStyle.fontSize),
+          // 比 DefaultTextStyle 准;嵌套 size 以块基准计算,属可接受边界。
+          style: TextStyle(fontSize: emojiBaseSize * scale),
+          children: _build(
+            children,
+            handler,
+            emojiBuilder,
+            mentionHandler,
+            imageBuilder,
+            footnoteHandler,
+            localDateBuilder,
+            mathInlineBuilder,
+            onDownloadAttachment,
+            emojiBaseSize,
+            totalImagesInPost,
+            context,
+            recognizers,
+            inheritedRecognizer: inheritedRecognizer,
+          ),
+        ),
       LineBreakRun() => TextSpan(
           text: '\n',
           recognizer: inheritedRecognizer,

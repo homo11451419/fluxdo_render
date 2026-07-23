@@ -17,6 +17,7 @@ export 'src/dev/fixtures_index.g.dart';
 export 'src/flatten/flatten_cache.dart';
 export 'src/flatten/inline_flattener.dart';
 export 'src/node/node.dart';
+export 'src/parser/arrow_ligature.dart';
 export 'src/parser/paragraph_parser.dart';
 export 'src/render/code_block_handler.dart';
 export 'src/render/emoji_handler.dart';

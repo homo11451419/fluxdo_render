@@ -16,6 +16,7 @@ import 'package:html/parser.dart' as html_parser;
 import 'dart:ui' show TextAlign, Color;
 
 import '../node/node.dart';
+import 'arrow_ligature.dart';
 
 class ParagraphParser {
   ParagraphParser();
@@ -472,7 +473,7 @@ class ParagraphParser {
                   if (text.trim().isNotEmpty) {
                     out.add(ParagraphNode(
                       id: nextId(),
-                      inlines: List.unmodifiable([TextRun(text)]),
+                      inlines: List.unmodifiable([_proseText(text)]),
                     ));
                   }
                 }
@@ -577,7 +578,7 @@ class ParagraphParser {
                 if (text.trim().isNotEmpty) {
                   out.add(ParagraphNode(
                     id: nextId(),
-                    inlines: List.unmodifiable([TextRun(text)]),
+                    inlines: List.unmodifiable([_proseText(text)]),
                   ));
                 }
             }
@@ -585,7 +586,7 @@ class ParagraphParser {
         case dom.Text():
           final text = _collapseWs(node.text);
           if (text.trim().isNotEmpty) {
-            pendingInlines.add(TextRun(text));
+            pendingInlines.add(_proseText(text));
           }
         // 其他节点类型(注释 / 文档类型等)忽略
       }
@@ -1638,7 +1639,7 @@ class ParagraphParser {
       inlines: List.unmodifiable([
         StyledRun(
           kind: InlineStyleKind.small,
-          children: List.unmodifiable([TextRun(caption)]),
+          children: List.unmodifiable([_proseText(caption)]),
         ),
       ]),
       textAlign: TextAlign.center,
@@ -2459,12 +2460,23 @@ class ParagraphParser {
         if (style != null) {
           final fg = _parseCssColor(_cssProp(style, 'color'));
           final bg = _parseCssColor(_cssProp(style, 'background-color'));
+          // 字号:Discourse [size=N] BBCode → `font-size:N%`。与着色可同时
+          // 出现在一个 span 上,所以先套字号再套颜色(顺序不影响语义)。
+          final scale = _parseCssFontScale(_cssProp(style, 'font-size'));
+          var inner = children;
+          if (scale != null) {
+            inner = [SizedRun(scale: scale, children: List.unmodifiable(children))];
+          }
           if (fg != null || bg != null) {
             out.add(ColoredRun(
               color: fg,
               background: bg,
-              children: List.unmodifiable(children),
+              children: List.unmodifiable(inner),
             ));
+            return;
+          }
+          if (scale != null) {
+            out.addAll(inner);
             return;
           }
           _recordUnhandled('span[style]');
@@ -2487,13 +2499,19 @@ class ParagraphParser {
       case dom.Text():
         final text = _collapseWs(node.text);
         if (text.isNotEmpty) {
-          out.add(TextRun(text));
+          out.add(_proseText(text));
         }
       case dom.Element():
         _collectInline(node, out, nextImageIndex);
       // 其他节点忽略
     }
   }
+
+  /// 散文文本 → TextRun,顺手做 ASCII 箭头连字(`->` → `→`)。
+  ///
+  /// **只用于散文**:行内代码走 InlineCodeRun、代码块走 CodeBlockNode,
+  /// 都不经过这里,所以代码里的 `->` 不会被改坏。
+  static TextRun _proseText(String text) => TextRun(applyArrowLigatures(text));
 
   /// 已支持的 inline 标签集合。
   static const _inlineTags = {
@@ -2535,6 +2553,21 @@ class ParagraphParser {
       }
     }
     return null;
+  }
+
+  /// 解析 `font-size` → 相对父字号的倍数。
+  ///
+  /// 只认**百分比**:Discourse 的 `[size=N]` BBCode 产出就是 `font-size:N%`
+  /// (实测 `[size=0]`→`0%`、`[size=150]`→`150%`)。绝对单位(px/em/rem…)
+  /// 语义不是"相对父级倍数",这里不认,交回 `_recordUnhandled` 暴露。
+  /// `0%` 合法(= 视觉隐藏,与网页端一致);负数/解析失败 → null。
+  static double? _parseCssFontScale(String? raw) {
+    if (raw == null) return null;
+    final s = raw.trim();
+    if (!s.endsWith('%')) return null;
+    final n = double.tryParse(s.substring(0, s.length - 1).trim());
+    if (n == null || n < 0) return null;
+    return n / 100.0;
   }
 
   /// 解析 CSS 颜色字符串 → [Color](对齐 fwfh:hex 3/4/6/8 位 + rgb()/rgba()

@@ -89,6 +89,9 @@ RenderTextProjection buildInlineProjection(List<InlineNode> inlines) {
         case ColoredRun(:final children):
           // 纯 TextSpan 着色,偏移连续 → 递归(同 Em/Strong)。
           walk(children);
+        case SizedRun(:final children):
+          // 纯 TextSpan 字号缩放,偏移连续 → 递归(同 ColoredRun)。
+          walk(children);
         case EmojiRun(:final name):
           addPlaceholder(name.isEmpty ? '' : ':$name:', ProjectionKind.emoji);
         case MentionRun(:final username, :final statusEmoji):

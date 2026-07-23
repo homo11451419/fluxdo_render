@@ -178,9 +178,19 @@ class SelectionHitTester {
     final position = TextPosition(offset: offset, affinity: affinity);
     final local = p.getOffsetForCaret(position, prototype);
 
+    final plain = p.text.toPlainText(
+      includeSemanticsLabels: false,
+      includePlaceholders: true,
+    );
+    // 前一个字符是换行符时,它的选区盒画在**上一行**,拿它当基准会把
+    // 光标按上一行去定位(上一行含大图时偏差就是整个图高)。
+    final afterLineBreak = offset > 0 &&
+        offset - 1 < plain.length &&
+        plain[offset - 1] == '\n';
+
     double top = local.dy;
     TextBox? nearest;
-    if (offset > 0) {
+    if (offset > 0 && !afterLineBreak) {
       final before = p.getBoxesForSelection(
         TextSelection(baseOffset: offset - 1, extentOffset: offset),
         boxHeightStyle: ui.BoxHeightStyle.max,
@@ -198,7 +208,17 @@ class SelectionHitTester {
         nearest = a;
       }
     }
-    if (nearest != null) top = nearest.bottom - lineHeight;
+    if (nearest != null) {
+      // 空末行的行高是**虚高**的:段落以 `\n` 收尾时,Flutter 把那条空行
+      // 排成与本段最高行等高(实测 [图片原子, \n] 段落高 318 = 159×2,
+      // 空行白白继承了图片行的 159)。此时 `bottom - lineHeight` 会把光标
+      // 压到虚高行的底部 —— 就是"图片后回车,光标掉到图下面老远"那个 bug,
+      // 随便打个字行高塌回正常值(179)又自己好了。
+      //
+      // 空行没有内容可对齐,行首就是它该在的地方,所以锚 top。
+      final onEmptyTrailingLine = afterLineBreak && offset >= plain.length;
+      top = onEmptyTrailingLine ? nearest.top : nearest.bottom - lineHeight;
+    }
 
     return Offset(local.dx, top) & Size(0, lineHeight);
   }

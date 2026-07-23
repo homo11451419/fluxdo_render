@@ -37,9 +37,14 @@ class EditableParagraph extends StatefulWidget {
     this.listMarkerOrdinal = 1,
     this.imageContentBuilder,
     this.emojiImageBuilder,
+    this.markerRanges = const [],
   });
 
   final TextBlock block;
+
+  /// 本段当前显形的字面 markdown 标记区间(`**`/`> `)。渲染成淡色 ——
+  /// 让用户一眼看出这是「标记」不是正文(展开态才非空)。
+  final List<(int, int)> markerRanges;
 
   /// 在编辑器文档中的序号(= blocks index;SelectableBlockId.docOrder)。
   final int documentOrder;
@@ -84,6 +89,8 @@ class _EditableParagraphState extends State<EditableParagraph> {
       widget.block.content.toInlines(
         forEditing: true,
         editingLinkColor: _linkColor,
+        markerRanges: widget.markerRanges,
+        markerColor: _markerColor,
       ),
       _effectiveStyle,
       // 行内图片原子(裸图):走宿主图片管线(upload 解析/解码上限),
@@ -107,13 +114,17 @@ class _EditableParagraphState extends State<EditableParagraph> {
   }
 
   Color? _linkColor;
+  Color? _markerColor;
 
   @override
   void didChangeDependencies() {
     super.didChangeDependencies();
     final next = Theme.of(context).colorScheme.primary;
-    if (next != _linkColor) {
+    final scheme = Theme.of(context).colorScheme;
+    final nextMarker = scheme.onSurfaceVariant.withValues(alpha: 0.45);
+    if (next != _linkColor || nextMarker != _markerColor) {
       _linkColor = next;
+      _markerColor = nextMarker;
       _disposeResult();
     }
   }
@@ -125,7 +136,8 @@ class _EditableParagraphState extends State<EditableParagraph> {
     if (oldWidget.block.content != widget.block.content ||
         oldWidget.block.kind != widget.block.kind ||
         oldWidget.block.headingLevel != widget.block.headingLevel ||
-        oldWidget.baseStyle != widget.baseStyle) {
+        oldWidget.baseStyle != widget.baseStyle ||
+        !listEquals(oldWidget.markerRanges, widget.markerRanges)) {
       _disposeResult();
     }
   }

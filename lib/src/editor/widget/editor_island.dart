@@ -66,6 +66,46 @@ class EditorIsland extends StatefulWidget {
   State<EditorIsland> createState() => _EditorIslandState();
 }
 
+/// 节点里是否含 0 倍字号([SizedRun] scale == 0,即 `[size=0]`)。
+///
+/// 这种内容渲染出来完全不可见,编辑态必须另给提示 —— 阅读端保持隐藏
+/// (对齐网页端),两边诉求不同。
+bool _hasZeroSize(BlockNode node) {
+  var found = false;
+  void scan(List<InlineNode> inlines) {
+    for (final n in inlines) {
+      if (found) return;
+      switch (n) {
+        case SizedRun(:final scale, :final children):
+          if (scale == 0) {
+            found = true;
+            return;
+          }
+          scan(children);
+        case EmRun(:final children):
+        case StrongRun(:final children):
+        case StyledRun(:final children):
+        case ColoredRun(:final children):
+        case LinkRun(:final children):
+        case SpoilerRun(:final children):
+          scan(children);
+        default:
+          break;
+      }
+    }
+  }
+
+  switch (node) {
+    case ParagraphNode(:final inlines):
+      scan(inlines);
+    case HeadingNode(:final inlines):
+      scan(inlines);
+    default:
+      break;
+  }
+  return found;
+}
+
 class _EditorIslandState extends State<EditorIsland> {
   /// 哑选区控制器:吞掉岛内块的注册,与编辑器 registry 隔离。
   late final SelectionController _inertController =
@@ -88,6 +128,31 @@ class _EditorIslandState extends State<EditorIsland> {
             child: widget.nodeFactory.build(context, widget.node),
           ),
         );
+
+    // `[size=0]` 这类 0 倍字号在编辑态渲染出来是**完全不可见**的 ——
+    // 块画在那儿却什么都看不到,用户既不知道有东西、也点不着。补一行
+    // 灰字说明,并给整块一个最小高度保证可点。
+    if (_hasZeroSize(widget.node)) {
+      content = Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          content,
+          Text(
+            '当前区域大小 = 0',
+            style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                  color: scheme.onSurfaceVariant,
+                ),
+          ),
+        ],
+      );
+    }
+
+    // 最小高度:块太薄不好点(尤其内容本身不可见时)
+    content = ConstrainedBox(
+      constraints: const BoxConstraints(minHeight: 28),
+      child: Align(alignment: Alignment.centerLeft, child: content),
+    );
 
     content = DecoratedBox(
       decoration: BoxDecoration(

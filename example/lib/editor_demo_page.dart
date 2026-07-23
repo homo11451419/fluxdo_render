@@ -14,6 +14,7 @@ const _demoHtml = '''
 <p>这是可编辑段落:支持 <strong>粗体</strong>、<em>斜体</em>、<code>行内代码</code>,
 以及 emoji <img src="https://linux.do/images/emoji/twitter/smile.png" title=":smile:" class="emoji" alt=":smile:"> 和
 <a class="mention" href="/u/sam">@sam</a> 原子(光标整跳、退格整删)。</p>
+<p>Mark Reveal 演示:将光标移到 <strong>粗体文字</strong> 或 <em>斜体文字</em> 或 <code>代码片段</code> 的边界，格式标记会自动展开显示（如 **、*、`），方便编辑。移开光标后自动折叠恢复渲染。试试 <strong>连续</strong><em>多种</em> 格式、<del>删除线文字</del> 也支持。</p>
 <blockquote>
 <p>引用块里的段落,块首退格逐级退出。</p>
 </blockquote>

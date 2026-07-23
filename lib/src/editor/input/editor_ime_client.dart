@@ -48,6 +48,19 @@ class EditorImeClient with TextInputClient {
 
   final EditorState state;
 
+  int? _viewId;
+
+  /// Text input must be attached to the Flutter view that owns the editor.
+  /// Windows rejects `TextInput.setClient` when this is null.
+  void updateViewId(int viewId) {
+    if (_viewId == viewId) return;
+    _viewId = viewId;
+    if (attached) {
+      detach();
+      syncFromState(show: false);
+    }
+  }
+
   /// input rule `--- ` 命中时的分隔线插入请求(岛节点由视图层经 cook
   /// 链路产,状态层不造岛)。参数 = 触发块 id(标记文本已清空)。
   void Function(String blockId)? onHorizontalRuleRequest;
@@ -77,13 +90,15 @@ class EditorImeClient with TextInputClient {
   final List<(String, int, int)> _recentSent = [];
 
   void _rememberSent(TextEditingValue v) {
-    _recentSent.add(
-        (v.text, v.selection.baseOffset, v.selection.extentOffset));
+    _recentSent.add((v.text, v.selection.baseOffset, v.selection.extentOffset));
     if (_recentSent.length > 8) _recentSent.removeAt(0);
   }
 
-  bool _isRecentEcho(TextEditingValue v) => _recentSent.contains(
-      (v.text, v.selection.baseOffset, v.selection.extentOffset));
+  bool _isRecentEcho(TextEditingValue v) => _recentSent.contains((
+    v.text,
+    v.selection.baseOffset,
+    v.selection.extentOffset,
+  ));
 
   /// 正在处理平台回调(updateEditingValue/performAction/...)。
   ///
@@ -148,6 +163,7 @@ class EditorImeClient with TextInputClient {
       _connection = TextInput.attach(
         this,
         TextInputConfiguration(
+          viewId: _viewId,
           inputType: TextInputType.multiline,
           // 回车键语义:编辑器自己分段,不让平台插 '\n'
           inputAction: TextInputAction.newline,
@@ -170,9 +186,11 @@ class EditorImeClient with TextInputClient {
     final blockChanged = _attachedBlockId != sel.extent.blockId;
     if (force || blockChanged || value != _lastSent) {
       _attachedBlockId = sel.extent.blockId;
-      _log('send text="${value.text}" sel=${value.selection.baseOffset}'
-          '..${value.selection.extentOffset} comp=${value.composing}'
-          '${force ? " (force)" : ""}${blockChanged ? " (blockChanged)" : ""}');
+      _log(
+        'send text="${value.text}" sel=${value.selection.baseOffset}'
+        '..${value.selection.extentOffset} comp=${value.composing}'
+        '${force ? " (force)" : ""}${blockChanged ? " (blockChanged)" : ""}',
+      );
       _connection!.setEditingState(value);
       _lastSent = value;
       _rememberSent(value);
@@ -207,9 +225,8 @@ class EditorImeClient with TextInputClient {
   // -----------------------------------------------------------------
 
   static TextEditingValue _format(TextEditingValue v) {
-    TextRange shift(TextRange r) => !r.isValid
-        ? r
-        : TextRange(start: r.start + 1, end: r.end + 1);
+    TextRange shift(TextRange r) =>
+        !r.isValid ? r : TextRange(start: r.start + 1, end: r.end + 1);
     return TextEditingValue(
       text: _padChar + v.text,
       selection: v.selection.isValid
@@ -220,6 +237,21 @@ class EditorImeClient with TextInputClient {
           : v.selection,
       composing: shift(v.composing),
     );
+  }
+
+  /// CJK 上屏后补判 input rules(typedChar 取光标前一字符)。
+  void _tryRulesAfterCommit(String blockId) {
+    final blk = state.textBlockById(blockId);
+    final caret = state.selection?.extent.offset ?? 0;
+    if (blk == null || caret <= 0 || caret > blk.content.length) return;
+    final outcome = tryApplyInputRules(
+      state,
+      blockId,
+      typedChar: blk.content.text[caret - 1],
+    );
+    if (outcome == InputRuleOutcome.hrRequest) {
+      onHorizontalRuleRequest?.call(blockId);
+    }
   }
 
   /// 剥 pad。返回 null 表示 pad 已被 IME 删掉(= 段首退格信号)。
@@ -235,9 +267,14 @@ class EditorImeClient with TextInputClient {
       text: v.text.substring(1),
       selection: v.selection.isValid
           ? v.selection.copyWith(
-              baseOffset: (v.selection.baseOffset - 1).clamp(0, v.text.length - 1),
-              extentOffset:
-                  (v.selection.extentOffset - 1).clamp(0, v.text.length - 1),
+              baseOffset: (v.selection.baseOffset - 1).clamp(
+                0,
+                v.text.length - 1,
+              ),
+              extentOffset: (v.selection.extentOffset - 1).clamp(
+                0,
+                v.text.length - 1,
+              ),
             )
           : v.selection,
       composing: unshift(v.composing),
@@ -267,10 +304,12 @@ class EditorImeClient with TextInputClient {
   void _updateEditingValueImpl(TextEditingValue rawValue) {
     final blockId = _attachedBlockId;
     if (blockId == null) return;
-    _log('recv text="${rawValue.text}" sel=${rawValue.selection.baseOffset}'
-        '..${rawValue.selection.extentOffset} '
-        'comp=${rawValue.composing} | lastSent="${_lastSent.text}" '
-        'sel=${_lastSent.selection.baseOffset}..${_lastSent.selection.extentOffset}');
+    _log(
+      'recv text="${rawValue.text}" sel=${rawValue.selection.baseOffset}'
+      '..${rawValue.selection.extentOffset} '
+      'comp=${rawValue.composing} | lastSent="${_lastSent.text}" '
+      'sel=${_lastSent.selection.baseOffset}..${_lastSent.selection.extentOffset}',
+    );
 
     // 幽灵块防御(真机日志实锤的死循环):attach 的段落可能已被结构操作
     // (段首合并/undo 换快照)移出文档 —— 此时报文若被静默吞掉,_lastSent
@@ -304,25 +343,44 @@ class EditorImeClient with TextInputClient {
       return;
     }
 
-    final prev = _unformat(_lastSent) ??
-        TextEditingValue(text: state.textBlockById(blockId)?.content.text ?? '');
+    final prev =
+        _unformat(_lastSent) ??
+        TextEditingValue(
+          text: state.textBlockById(blockId)?.content.text ?? '',
+        );
 
-    // 平台可能插入 '\n'(部分 IME 的回车路径不走 performAction)——
-    // 编辑器语义是分段,拦下来转 splitParagraph。
-    if (value.text.contains('\n')) {
-      final cleaned = value.text.replaceAll('\n', '');
-      if (cleaned == prev.text) {
-        state.splitBlock();
+    // '\n' 的语义要按**来源**区分:
+    // - **新插入**的 '\n' = 回车(部分 IME 的回车路径不走 performAction),
+    //   编辑器语义是分段,拦下来转 splitBlock;
+    // - **段内既有**的 '\n' = 本段软换行(cook 的 <br> 导入即是此形态,
+    //   序列化写行尾双空格),是正当内容,必须原样留着。
+    //
+    // 早先这里无条件 `replaceAll('\n', '')`,把两者一起洗了 —— 真机症状:
+    // 网页端带换行的草稿在 fluxdo 打开后,只要打一个字,整段换行全没,
+    // 几行并成一行。
+    //
+    // 注意**不能**在这里剥 FFFC:窗口文本里的 FFFC 是既有原子的合法哨兵,
+    // 整体剥除会被 diff 误判为"删除了原子"。幻造哨兵只可能出现在**新插入
+    // 段**里 → 对 diff.inserted 单独 sanitize(见下)。
+    var sanitizedText = value.text;
+    final rawDiff = diffWithCaret(
+      prev.text,
+      sanitizedText,
+      value.selection.extentOffset,
+    );
+    if (rawDiff != null && rawDiff.inserted.contains('\n')) {
+      final withoutBreaks = rawDiff.inserted.replaceAll('\n', '');
+      if (withoutBreaks.isEmpty && rawDiff.oldEnd == rawDiff.start) {
+        // 纯插入换行 = 回车 → 按宿主策略分段或插软换行
+        state.insertNewline();
         syncFromState(show: false);
         return;
       }
-      // 混合变更(罕见):先按纯文本处理,'\n' 剥掉。
+      // 混合变更:只剥**插入段内**的换行,既有换行不动。
+      sanitizedText = sanitizedText.substring(0, rawDiff.start) +
+          withoutBreaks +
+          sanitizedText.substring(rawDiff.start + rawDiff.inserted.length);
     }
-    // 剥 '\n'(编辑器语义是分段,不进文本)。注意**不能**在这里剥 FFFC:
-    // 窗口文本里的 FFFC 是既有原子的合法哨兵,整体剥除会被 diff 误判为
-    // "删除了原子"。幻造哨兵只可能出现在**新插入段**里 → 对 diff.inserted
-    // 单独 sanitize(见下)。
-    final sanitizedText = value.text.replaceAll('\n', '');
 
     // 三段式 diff(对比上次值,caret 锚定):公共前缀/后缀 → 中段即变更。
     final diff = diffWithCaret(
@@ -356,14 +414,42 @@ class EditorImeClient with TextInputClient {
           0,
           0,
           '',
-          caretOffset: value.selection.extentOffset
-              .clamp(0, sanitizedText.length),
+          caretOffset: value.selection.extentOffset.clamp(
+            0,
+            sanitizedText.length,
+          ),
           composing: composing,
         );
       } else if (state.hasComposing) {
         // composing 刚结束的收尾通知(无文本变化):清标记 + 封历史口。
-        state.updateComposing(TextRange.empty);
+        // Windows(微软拼音)上屏是两步:先发「文本+composing(选区仍
+        // 滞后在拼音组首)」,再发本通知(composing 清空 + **最终光标**)。
+        // 收尾通知里的选区才是上屏后的真实光标,必须采纳 —— 否则光标
+        // 停在组首,表现为"打完字光标跳到文字前面"。
+        if (value.selection.isValid) {
+          state.imeReplace(
+            blockId,
+            0,
+            0,
+            '',
+            caretOffset: value.selection.extentOffset.clamp(
+              0,
+              sanitizedText.length,
+            ),
+          );
+        } else {
+          state.updateComposing(TextRange.empty);
+        }
         state.sealHistory();
+        // 上屏收尾补判 input rules:本通知**没有文本变化**(走的就是
+        // diff==null 这条路),下面按 diff.inserted 触发的常规路径进不来。
+        //
+        // 真机失效顺序:先打 `**`,再打拼音,再打闭合 `**`,最后上屏 ——
+        // 敲 `*` 时拼音还在 composing 里,规则按约定跳过;上屏后没人再判
+        // 一次,`**编辑器**` 就永远停在字面星号(`~~x~~` 同理)。
+        //
+        // typedChar 取光标前一字符:上屏后它就是这段输入的收尾字符。
+        _tryRulesAfterCommit(blockId);
       } else if (!isEcho && value.selection.isValid) {
         // 只认**全选形状**(0..len):菜单 Edit 唯一主动发的选区就是
         // Select All;其余非回显纯选区通知维持忽略(回显可能带轻微
@@ -392,8 +478,10 @@ class EditorImeClient with TextInputClient {
       diff.start,
       diff.oldEnd,
       cleanInserted,
-      caretOffset: (value.selection.extentOffset - phantomCount)
-          .clamp(0, sanitizedText.length - phantomCount),
+      caretOffset: (value.selection.extentOffset - phantomCount).clamp(
+        0,
+        sanitizedText.length - phantomCount,
+      ),
       composing: composing,
     );
 
@@ -420,6 +508,9 @@ class EditorImeClient with TextInputClient {
       if (outcome == InputRuleOutcome.hrRequest) {
         onHorizontalRuleRequest?.call(blockId);
       }
+    } else if (!composingActive && wasComposing) {
+      // 上屏同时还带了文本变化(部分 IME 会把最后一个字符和上屏合并发)
+      _tryRulesAfterCommit(blockId);
     }
 
     // reconcile:若应用后文档与 IME 认知不一致(编辑器改写了内容,
@@ -453,8 +544,9 @@ class EditorImeClient with TextInputClient {
         final oldHead = oldText.substring(0, oldText.length - tail.length);
         final newHead = newText.substring(0, caret);
         var prefix = 0;
-        final minLen =
-            oldHead.length < newHead.length ? oldHead.length : newHead.length;
+        final minLen = oldHead.length < newHead.length
+            ? oldHead.length
+            : newHead.length;
         while (prefix < minLen && oldHead[prefix] == newHead[prefix]) {
           prefix++;
         }
@@ -468,8 +560,9 @@ class EditorImeClient with TextInputClient {
 
     // fallback:纯公共前缀/后缀。
     var prefix = 0;
-    final minLen =
-        oldText.length < newText.length ? oldText.length : newText.length;
+    final minLen = oldText.length < newText.length
+        ? oldText.length
+        : newText.length;
     while (prefix < minLen && oldText[prefix] == newText[prefix]) {
       prefix++;
     }
@@ -494,7 +587,7 @@ class EditorImeClient with TextInputClient {
       _applyingPlatformUpdate = true;
       try {
         state.sealHistory();
-        state.splitBlock();
+        state.insertNewline();
         syncFromState(show: false);
       } finally {
         _applyingPlatformUpdate = false;

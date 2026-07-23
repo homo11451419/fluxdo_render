@@ -9,6 +9,7 @@
 library;
 
 export 'src/editor/input/editor_ime_client.dart' show EditorImeClient;
+export 'src/editor/input/editor_key_handler.dart' show primaryModifierHeld, shiftModifierHeld;
 export 'src/editor/model/doc_converter.dart';
 export 'src/editor/model/editable_text_content.dart';
 export 'src/editor/model/editor_block.dart';
